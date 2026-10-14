@@ -141,6 +141,17 @@ class ClipSearch(BaseTool):
                 "items": {"type": "string"},
                 "description": "Clip ids to skip (already used in this edit).",
             },
+            "location": {
+                "type": "object",
+                "description": "rank_for_slot: drop clips whose source_tags name "
+                               "the wrong place. Same shape as corpus_builder "
+                               "filters.location (lib/location_filter.py).",
+                "properties": {
+                    "include_terms": {"type": "array", "items": {"type": "string"}},
+                    "exclude_terms": {"type": "array", "items": {"type": "string"}},
+                    "require_include": {"type": "boolean", "default": False},
+                },
+            },
             # find_similar_set
             "seed_clip_id": {"type": "string"},
             "n": {"type": "integer", "default": 5, "minimum": 1},
@@ -287,16 +298,27 @@ def _op_rank_for_slot(corp, inputs: dict[str, Any]) -> dict[str, Any]:
 
     q_vec = embed_texts([query_text])[0]
 
+    exclude_ids = list(inputs.get("exclude_ids") or [])
+    location_rejected: list[str] = []
+    if inputs.get("location"):
+        from lib.location_filter import check_location
+
+        for rec in corp.records:
+            if not check_location(rec.source_tags, inputs["location"])[0]:
+                location_rejected.append(rec.clip_id)
+        exclude_ids.extend(location_rejected)
+
     results = corp.rank_by_text(
         query_embedding=q_vec,
         k=int(inputs.get("k", 10)),
         tag_weight=float(inputs.get("tag_weight", 0.3)),
         motion_min=inputs.get("motion_min"),
         kind=inputs.get("kind"),
-        exclude_ids=inputs.get("exclude_ids") or [],
+        exclude_ids=exclude_ids,
     )
     return {
         "query_text": query_text,
+        "location_rejected_count": len(location_rejected),
         "results": [
             {"score": score, "record": asdict(rec)}
             for rec, score in results

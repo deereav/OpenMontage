@@ -224,6 +224,11 @@ corpus_builder.execute({
         "max_duration": 40,
         "orientation": "landscape",
         "min_width": 1280,
+        # Place-specific brief? Reject look-alike locations before download.
+        "location": {
+            "include_terms": ["utah", "zion", "moab", "bryce", "canyonlands"],
+            "exclude_terms": ["jordan", "arizona", "nevada", "california", "sedona"],
+        },
     },
     "max_new_clips": 150,          # enlarge the search space
     "thumbs_per_video": 5,
@@ -246,6 +251,17 @@ corpus_builder.execute({
   `nasa`-only batch. NASA is slow and its results are niche.
 - `unsplash` is image-only. Use it as a support source, not the
   backbone of a motion-led documentary cut.
+- **Place-specific briefs** ("a montage of Utah") need `filters.location`.
+  CLIP happily ranks Wadi Rum or Sedona for "red rock canyon at sunset".
+  The check reads each provider's own title/description/tags (never
+  the query), word-matched and case-insensitive. A clip naming an
+  `exclude_terms` place is dropped unless it also names an
+  `include_terms` place ("the border of Utah and Arizona" stays). Fill
+  `exclude_terms` with the obvious look-alikes for the place. Set
+  `require_include: true` only when the brief demands verified
+  locations — it also drops clips with no place name at all, which
+  thins the corpus a lot. Rejections are reported in
+  `location_rejections`.
 
 ### 3. Sanity-Check The Corpus Before Retrieval
 
@@ -284,6 +300,7 @@ clip_search.execute({
     "motion_min": 1.5,
     "kind": "video",
     "exclude_ids": already_picked_ids,      # global accumulator
+    "location": brief_location_filter,      # same shape as corpus filters.location
 })
 ```
 

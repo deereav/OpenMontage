@@ -168,6 +168,17 @@ class CorpusBuilder(BaseTool):
                         "enum": ["landscape", "portrait", "square"],
                     },
                     "min_width": {"type": "integer"},
+                    "location": {
+                        "type": "object",
+                        "description": "Place-name check on each candidate's "
+                                       "title/description/tags, applied before "
+                                       "download. See lib/location_filter.py.",
+                        "properties": {
+                            "include_terms": {"type": "array", "items": {"type": "string"}},
+                            "exclude_terms": {"type": "array", "items": {"type": "string"}},
+                            "require_include": {"type": "boolean", "default": False},
+                        },
+                    },
                 },
             },
             "max_new_clips": {
@@ -240,6 +251,7 @@ class CorpusBuilder(BaseTool):
         start = time.time()
         try:
             from lib.corpus import Corpus
+            from lib.location_filter import check_location
             from tools.video.clip_cache import get_default_cache
             from tools.video.stock_sources import (
                 SearchFilters,
@@ -256,6 +268,7 @@ class CorpusBuilder(BaseTool):
             max_new = int(inputs.get("max_new_clips", 100))
             skip_existing = bool(inputs.get("skip_existing", True))
             thumbs_per_video = int(inputs.get("thumbs_per_video", 5))
+            location_spec: Optional[dict] = filters_in.get("location")
 
             # Resolve sources. If the caller passed an explicit list we
             # must not silently degrade: pinned-but-unavailable sources
@@ -315,6 +328,7 @@ class CorpusBuilder(BaseTool):
             errors: list[dict] = []
             skipped = 0
             failed = 0
+            location_rejected: list[dict] = []
             candidates_seen = 0
 
             def filters_for(q_spec: dict) -> SearchFilters:
@@ -354,6 +368,17 @@ class CorpusBuilder(BaseTool):
 
                         if skip_existing and corp.has(cand.clip_id):
                             skipped += 1
+                            continue
+
+                        # Check the provider's own text only: the search
+                        # query names the target place and would vouch for
+                        # every candidate it returned.
+                        keep, why = (
+                            check_location(getattr(cand, "source_tags", ""), location_spec)
+                            if location_spec else (True, "")
+                        )
+                        if not keep:
+                            location_rejected.append({"clip_id": cand.clip_id, "reason": why})
                             continue
 
                         try:
@@ -441,6 +466,8 @@ class CorpusBuilder(BaseTool):
                     "clips_added": len(added_ids),
                     "clips_skipped_existing": skipped,
                     "clips_failed": failed,
+                    "clips_rejected_location": len(location_rejected),
+                    "location_rejections": location_rejected[:25],
                     "per_source_counts": per_source_counts,
                     "added_ids": added_ids,
                     "total_corpus_size": len(corp),
