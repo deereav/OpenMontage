@@ -31,6 +31,8 @@ const toneGradient = (tone: CinematicTone) => {
       return "linear-gradient(180deg, rgba(2,4,8,0.14) 0%, rgba(0,0,0,0.56) 100%)";
     case "neutral":
       return "linear-gradient(180deg, rgba(10,10,12,0.16) 0%, rgba(0,0,0,0.42) 100%)";
+    case "clear":
+      return "none";
     case "cold":
     default:
       return "linear-gradient(180deg, rgba(8,16,24,0.18) 0%, rgba(2,4,8,0.42) 100%)";
@@ -100,7 +102,7 @@ const SceneVideo: React.FC<{ scene: CinematicVideoScene }> = ({ scene }) => {
       <AbsoluteFill
         style={{
           background:
-            "radial-gradient(circle at center, transparent 52%, rgba(0,0,0,0.52) 100%)",
+            `radial-gradient(circle at center, transparent 52%, rgba(0,0,0,${scene.vignette ?? 0.52}) 100%)`,
         }}
       />
       <AbsoluteFill

@@ -539,26 +539,6 @@ class CorpusBuilder(BaseTool):
                     pass
                 return None
 
-            # Ingest the fresh file into the shared cache so the
-            # next run can hit it. Swallow ingest failures — the
-            # current run already has the bytes locally, which is
-            # what matters for this build.
-            try:
-                cache.ingest(
-                    cand.clip_id,
-                    local_abs,
-                    metadata={
-                        "source": cand.source,
-                        "source_id": cand.source_id,
-                        "source_url": cand.source_url,
-                        "license": cand.license,
-                        "creator": cand.creator,
-                        "source_tags": cand.source_tags,
-                    },
-                )
-            except Exception:
-                pass
-
         thumb_dir_rel = Path("thumbnails") / cand.clip_id
         thumb_dir_abs = corp.corpus_dir / thumb_dir_rel
         thumb_dir_abs.mkdir(parents=True, exist_ok=True)
@@ -587,6 +567,28 @@ class CorpusBuilder(BaseTool):
             img = cv2.imread(str(local_abs))
             if img is not None:
                 height, width = img.shape[:2]
+
+        # Ingest only after the file has decoded into thumbnails: a
+        # non-media payload (HLS playlist, HTML error page) cached here
+        # would be re-served on every later run and fail every time.
+        # Swallow ingest failures — the current run already has the
+        # bytes locally, which is what matters for this build.
+        if not cache_hit:
+            try:
+                cache.ingest(
+                    cand.clip_id,
+                    local_abs,
+                    metadata={
+                        "source": cand.source,
+                        "source_id": cand.source_id,
+                        "source_url": cand.source_url,
+                        "license": cand.license,
+                        "creator": cand.creator,
+                        "source_tags": cand.source_tags,
+                    },
+                )
+            except Exception:
+                pass
 
         # CLIP embeddings. embed_images loads the model lazily on
         # first call; subsequent candidates reuse the cached model.

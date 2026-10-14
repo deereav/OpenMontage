@@ -763,9 +763,22 @@ class VideoCompose(BaseTool):
         return comp
 
     @staticmethod
-    def _cuts_to_cinematic_scenes(cuts: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Adapt canonical sequential cuts to CinematicRenderer's scene contract."""
+    def _cuts_to_cinematic_scenes(
+        cuts: list[dict[str, Any]],
+        scene_style: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Adapt canonical sequential cuts to CinematicRenderer's scene contract.
 
+        ``scene_style`` (from ``edit_decisions.metadata.cinematic_scene_style``)
+        optionally overrides the renderer's baked-in look on every video
+        scene: ``tone`` (cold/steel/void/neutral/clear), ``filter`` (CSS
+        filter string) and ``vignette`` (0-1 edge darkness).
+        """
+
+        style = {
+            k: v for k, v in (scene_style or {}).items()
+            if k in ("tone", "filter", "vignette") and v is not None
+        }
         scenes: list[dict[str, Any]] = []
         timeline_cursor = 0.0
         hard_transitions = {"cut", "none"}
@@ -814,6 +827,7 @@ class VideoCompose(BaseTool):
                     "trimBeforeSeconds": source_in,
                     "trimAfterSeconds": source_out,
                     "playbackRate": speed,
+                    **style,
                 }
                 if str(cut.get("transition_in") or "").lower() in hard_transitions:
                     scene["fadeInFrames"] = 0
@@ -1997,7 +2011,10 @@ class VideoCompose(BaseTool):
 
         if composition_id == "CinematicRenderer":
             if not props.get("scenes") and props.get("cuts"):
-                props["scenes"] = self._cuts_to_cinematic_scenes(props["cuts"])
+                props["scenes"] = self._cuts_to_cinematic_scenes(
+                    props["cuts"],
+                    (composition_data.get("metadata") or {}).get("cinematic_scene_style"),
+                )
             props.pop("cuts", None)
             if not props.get("scenes"):
                 return ToolResult(

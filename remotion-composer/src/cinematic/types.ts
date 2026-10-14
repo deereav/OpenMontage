@@ -1,4 +1,4 @@
-export type CinematicTone = "cold" | "steel" | "void" | "neutral";
+export type CinematicTone = "cold" | "steel" | "void" | "neutral" | "clear";
 
 export interface CinematicBaseScene {
   id: string;
@@ -14,6 +14,8 @@ export interface CinematicVideoScene extends CinematicBaseScene {
   trimAfterSeconds?: number;
   playbackRate?: number;
   filter?: string;
+  /** Edge darkness of the radial vignette, 0-1. Defaults to 0.52. */
+  vignette?: number;
   fadeInFrames?: number;
   fadeOutFrames?: number;
 }
