@@ -175,3 +175,40 @@ def test_remotion_render_preserves_direct_cinematic_scenes(monkeypatch, tmp_path
 
     assert result.success, result.error
     assert captured["props"]["scenes"] == [scene]
+
+
+_VIDEO_CUT = {"id": "v1", "source": "clip.mp4", "in_seconds": 0, "out_seconds": 2}
+
+
+def test_documentary_montage_defaults_to_natural_look() -> None:
+    scene = VideoCompose._cuts_to_cinematic_scenes(
+        [_VIDEO_CUT], renderer_family="documentary-montage",
+    )[0]
+
+    assert scene["tone"] == "clear"
+    assert scene["vignette"] == 0.25
+    assert "saturate(1.02)" in scene["filter"]
+
+
+def test_trailer_keeps_renderer_baked_in_look() -> None:
+    scene = VideoCompose._cuts_to_cinematic_scenes(
+        [_VIDEO_CUT], renderer_family="cinematic-trailer",
+    )[0]
+
+    assert not {"tone", "filter", "vignette"} & scene.keys()
+
+
+def test_named_preset_and_overrides_win_over_family_default() -> None:
+    scene = VideoCompose._cuts_to_cinematic_scenes(
+        [_VIDEO_CUT],
+        {"preset": "moody", "vignette": 0.3},
+        renderer_family="documentary-montage",
+    )[0]
+
+    assert scene["tone"] == "cold"
+    assert scene["vignette"] == 0.3
+
+
+def test_unknown_preset_is_rejected() -> None:
+    with pytest.raises(ValueError, match="Valid presets"):
+        VideoCompose._cuts_to_cinematic_scenes([_VIDEO_CUT], {"preset": "sepia"})

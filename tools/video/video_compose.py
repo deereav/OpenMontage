@@ -175,6 +175,14 @@ class VideoCompose(BaseTool):
                 },
             },
             "audio_path": {"type": "string", "description": "Mixed audio to mux into output"},
+            "normalize_clips": {
+                "type": "boolean",
+                "default": True,
+                "description": "render: re-encode source clips that don't match the "
+                               "profile (codec, size, fps, letterbox) before rendering. "
+                               "edit_decisions.audio.music is mixed in automatically "
+                               "unless audio_path is given.",
+            },
             "profile": {
                 "type": "string",
                 "description": (
@@ -434,6 +442,317 @@ class VideoCompose(BaseTool):
             data={"output": str(video_path), "has_mixed_audio": True},
             artifacts=[str(video_path)],
         )
+
+    # ------------------------------------------------------------------
+    # Music bed from edit_decisions.audio.music
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _probe_duration(path: Path) -> float:
+        out = subprocess.check_output(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nw=1:nk=1", str(path)],
+            text=True, timeout=60,
+        )
+        return float(out.strip())
+
+    @classmethod
+    def _has_audible_audio(cls, path: Path) -> bool:
+        """Audio stream present AND not digital silence (Remotion can emit a
+        silent track when a composition has no sound)."""
+        if not cls._has_audio_stream(path):
+            return False
+        proc = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-nostats", "-i", str(path), "-map", "0:a:0",
+             "-af", "volumedetect", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=600,
+        )
+        for line in proc.stderr.splitlines():
+            if "max_volume:" in line:
+                try:
+                    return float(line.split("max_volume:")[1].split("dB")[0]) > -60.0
+                except ValueError:
+                    return True
+        return True
+
+    @staticmethod
+    def _music_config(
+        edit_decisions: dict[str, Any],
+        asset_lookup: dict[str, dict[str, Any]],
+    ) -> tuple[dict[str, Any], Path] | None:
+        """Resolve the music bed (``audio.music``, else legacy top-level
+        ``music``) to its config and an existing file path.
+
+        ``metadata.silence_window`` (one ``{start_seconds, end_seconds}`` or a
+        list of them) is carried into the config as ``silence_windows``.
+        """
+        cfg = (edit_decisions.get("audio") or {}).get("music") or edit_decisions.get("music")
+        if not cfg or not cfg.get("asset_id"):
+            return None
+        windows = (edit_decisions.get("metadata") or {}).get("silence_window") or []
+        cfg = dict(cfg, silence_windows=[windows] if isinstance(windows, dict) else list(windows))
+        ref = str(cfg["asset_id"])
+        path = Path(asset_lookup.get(ref, {}).get("path") or ref)
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"Music asset {ref!r} not found in asset_manifest or on disk ({path})."
+            )
+        return cfg, path
+
+    def _mix_music_into_render(
+        self,
+        video_path: Path,
+        music_path: Path,
+        cfg: dict[str, Any],
+    ) -> ToolResult:
+        """Lay a music bed under the rendered video, in place.
+
+        The track is looped/trimmed to the video, loudness-matched, faded,
+        and — when the render already carries audible sound (narration) —
+        ducked under it. The final mix is normalized to ``loudness_lufs``
+        (default -14, streaming loudness).
+
+        ``volume`` scales the bed after it is matched to the target loudness:
+        default 1.0 for music-only videos, 0.2 (about -14 dB) under a voice.
+        ``replace_render_audio: true`` drops the render's own audio (e.g.
+        stock-clip ambience) instead of mixing with it. Each of
+        ``silence_windows`` mutes the bed with 0.2 s ramps either side.
+        """
+        duration = self._probe_duration(video_path)
+        keep_render_audio = not cfg.get("replace_render_audio") and self._has_audible_audio(video_path)
+        target = float(cfg.get("loudness_lufs", -14))
+        volume = float(cfg.get("volume", 0.2 if keep_render_audio else 1.0))
+        fade_in = min(float(cfg.get("fade_in_seconds", 1.0)), duration / 2)
+        fade_out = min(float(cfg.get("fade_out_seconds", 3.0)), duration / 2)
+
+        # loudnorm upsamples to 192 kHz in 0.1 s blocks; resample and re-chunk
+        # to 10 ms frames so the time-based gains below land where intended.
+        music_chain = (
+            f"[1:a]atrim=0:{duration:.3f},asetpts=PTS-STARTPTS,"
+            f"loudnorm=I={target}:TP=-2:LRA=11,"
+            f"aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
+            f"asetpts=N/SR/TB,asetnsamples=n=480:p=0,volume={volume:.4f}"
+        )
+        for window in cfg.get("silence_windows") or []:
+            start, end = float(window["start_seconds"]), float(window["end_seconds"])
+            music_chain += (
+                f",volume='clip(max(({start:.3f}-t)/0.2,(t-{end:.3f})/0.2),0,1)':eval=frame"
+            )
+        music_chain += (
+            f",afade=t=in:d={fade_in:.3f}"
+            f",afade=t=out:st={max(0.0, duration - fade_out):.3f}:d={fade_out:.3f}"
+        )
+        ducked = False
+        if keep_render_audio:
+            ducking = cfg.get("ducking", True)
+            duck = ducking if isinstance(ducking, dict) else {"enabled": bool(ducking)}
+            voice = "[0:a]aformat=sample_rates=48000:channel_layouts=stereo"
+            ducked = bool(duck.get("enabled", True))
+            if ducked:
+                threshold = 10 ** (float(duck.get("threshold_db", -30)) / 20)
+                ratio = max(1.0, 10 ** (float(duck.get("reduction_db", 9)) / 20) * 2)
+                graph = (
+                    f"{music_chain}[m];{voice},asplit[v][key];"
+                    f"[m][key]sidechaincompress=threshold={threshold:.5f}:ratio={ratio:.2f}:"
+                    f"attack={float(duck.get('attack_ms', 20))}:"
+                    f"release={float(duck.get('release_ms', 400))}[md];"
+                    f"[v][md]amix=inputs=2:duration=first:normalize=0,"
+                )
+            else:
+                graph = f"{music_chain}[m];{voice}[v];[v][m]amix=inputs=2:duration=first:normalize=0,"
+        else:
+            graph = f"{music_chain},"
+        graph += f"loudnorm=I={target}:TP=-1.5:LRA=11,aresample=48000[aout]"
+
+        temp_output = video_path.with_name(
+            f".{video_path.stem}.music-mix-{time.time_ns()}{video_path.suffix}"
+        )
+        try:
+            self.run_command([
+                "ffmpeg", "-y",
+                "-i", str(video_path),
+                "-stream_loop", "-1", "-i", str(music_path),
+                "-filter_complex", graph,
+                "-map", "0:v:0", "-map", "[aout]",
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                "-t", f"{duration:.3f}",
+                "-movflags", "+faststart",
+                str(temp_output),
+            ])
+            if not temp_output.is_file():
+                return ToolResult(success=False, error=f"Music mix output missing: {temp_output}")
+            temp_output.replace(video_path)
+        except Exception as exc:
+            return ToolResult(success=False, error=f"Could not mix music bed: {exc}")
+        finally:
+            if temp_output.exists():
+                temp_output.unlink()
+
+        return ToolResult(
+            success=True,
+            data={
+                "music_path": str(music_path),
+                "music_volume": volume,
+                "music_ducked": ducked,
+                "kept_render_audio": keep_render_audio,
+                "loudness_lufs": target,
+            },
+        )
+
+    # ------------------------------------------------------------------
+    # Source clip normalization
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _probe_video(path: Path) -> dict[str, Any] | None:
+        try:
+            out = subprocess.check_output(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=codec_name,pix_fmt,width,height,avg_frame_rate",
+                 "-show_entries", "format=format_name",
+                 "-of", "json", str(path)],
+                text=True, timeout=60,
+            )
+        except Exception:
+            return None
+        data = json.loads(out)
+        streams = data.get("streams") or []
+        if not streams:
+            return None
+        info = dict(streams[0])
+        info["format_name"] = (data.get("format") or {}).get("format_name", "")
+        return info
+
+    @staticmethod
+    def _detect_letterbox(path: Path, width: int, height: int) -> str | None:
+        """Return an ffmpeg ``crop=`` expression when the clip has baked-in
+        black bars (>=4% of either dimension), else None."""
+        try:
+            duration = VideoCompose._probe_duration(path)
+        except Exception:
+            duration = 0.0
+        proc = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-nostats",
+             "-ss", f"{max(0.0, duration / 2 - 1):.2f}", "-i", str(path),
+             "-t", "2", "-vf", "cropdetect=limit=24:round=2:reset=0", "-an", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=120,
+        )
+        crop = None
+        for line in proc.stderr.splitlines():
+            if "crop=" in line:
+                crop = line.rsplit("crop=", 1)[1].split()[0]
+        if not crop:
+            return None
+        try:
+            cw, ch, _, _ = (int(v) for v in crop.split(":"))
+        except ValueError:
+            return None
+        if cw <= 0 or ch <= 0:
+            return None
+        if ch < height * 0.96 or cw < width * 0.96:
+            return f"crop={crop}"
+        return None
+
+    def _normalize_clip_sources(
+        self,
+        resolved_cuts: list[dict[str, Any]],
+        cache_dir: Path,
+        profile: Optional[str],
+    ) -> dict[str, Any]:
+        """Re-encode video sources that don't match the output profile.
+
+        Stock clips arrive as HLS remuxes, Ogg/WebM, odd frame rates, other
+        aspect ratios, or with letterbox bars baked in. Each unique source is
+        probed; mismatches are cropped (letterbox), scaled to cover, centre
+        cropped, conformed to the profile fps and encoded H.264/yuv420p into
+        ``cache_dir`` (keyed by path, size, mtime and target, so re-renders
+        reuse them). ``resolved_cuts`` are updated in place. Failures keep the
+        original source and are reported, never fatal.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        width, height, fps = 1920, 1080, 30.0
+        if profile:
+            try:
+                from lib.media_profiles import get_profile
+                p = get_profile(profile)
+                width, height, fps = p.width, p.height, float(p.fps)
+            except Exception:
+                pass
+
+        sources: dict[Path, list[dict[str, Any]]] = {}
+        for cut in resolved_cuts:
+            src = str(cut.get("source") or "")
+            if not src or src.startswith(("http://", "https://", "data:")):
+                continue
+            path = Path(self._file_uri_to_raw_path(src) if src.lower().startswith("file://") else src)
+            if path.is_file() and not self._is_image(path):
+                sources.setdefault(path.resolve(), []).append(cut)
+
+        def plan(path: Path) -> tuple[Path, Optional[Path], str, Optional[str]]:
+            info = self._probe_video(path)
+            if info is None:
+                return path, None, "not a video (skipped)", None
+            num, _, den = str(info.get("avg_frame_rate") or "0/1").partition("/")
+            src_fps = float(num) / float(den or 1) if float(den or 1) else 0.0
+            w, h = int(info.get("width") or 0), int(info.get("height") or 0)
+            letterbox = self._detect_letterbox(path, w, h)
+            reasons = []
+            if info.get("codec_name") != "h264":
+                reasons.append(f"codec {info.get('codec_name')}")
+            if info.get("pix_fmt") != "yuv420p":
+                reasons.append(f"pix_fmt {info.get('pix_fmt')}")
+            if (w, h) != (width, height):
+                reasons.append(f"{w}x{h}")
+            if abs(src_fps - fps) > 0.01:
+                reasons.append(f"{src_fps:.3g}fps")
+            if "mp4" not in str(info.get("format_name")):
+                reasons.append(f"container {info.get('format_name')}")
+            if letterbox:
+                reasons.append("letterboxed")
+            if not reasons:
+                return path, None, "already conformed", None
+
+            stat = path.stat()
+            key = f"{path}|{stat.st_size}|{stat.st_mtime_ns}|{width}x{height}@{fps}"
+            out = cache_dir / f"{hashlib.sha256(key.encode()).hexdigest()[:16]}-{path.stem}.mp4"
+            if out.is_file():
+                return path, out, ", ".join(reasons) + " (cached)", None
+            vf = ",".join(filter(None, [
+                letterbox,
+                f"scale={width}:{height}:force_original_aspect_ratio=increase:flags=lanczos",
+                f"crop={width}:{height}",
+                f"fps={fps:g}",
+                "format=yuv420p",
+            ]))
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            tmp = out.with_suffix(".part.mp4")
+            proc = subprocess.run(
+                ["ffmpeg", "-y", "-loglevel", "error", "-i", str(path),
+                 "-map", "0:v:0", "-map", "0:a:0?", "-vf", vf,
+                 "-c:v", "libx264", "-preset", "fast", "-crf", "16", "-g", str(int(round(fps))),
+                 "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(tmp)],
+                capture_output=True, text=True, timeout=1800,
+            )
+            if proc.returncode != 0 or not tmp.is_file():
+                with contextlib.suppress(OSError):
+                    tmp.unlink()
+                return path, None, ", ".join(reasons), proc.stderr.strip()[-300:] or "ffmpeg failed"
+            tmp.replace(out)
+            return path, out, ", ".join(reasons), None
+
+        report: dict[str, Any] = {"normalized": [], "unchanged": 0, "failed": []}
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            for path, out, why, err in pool.map(plan, list(sources)):
+                if err:
+                    report["failed"].append({"source": str(path), "reason": why, "error": err})
+                elif out is None:
+                    report["unchanged"] += 1
+                else:
+                    for cut in sources[path]:
+                        cut["source"] = str(out)
+                    report["normalized"].append({"source": str(path), "output": str(out), "reason": why})
+        return report
 
     def _compose(self, inputs: dict[str, Any]) -> ToolResult:
         """FFmpeg composition: concat video cuts, add audio, burn subtitles.
@@ -762,23 +1081,69 @@ class VideoCompose(BaseTool):
             )
         return comp
 
-    @staticmethod
+    # Named looks for CinematicRenderer video scenes. "moody" is the
+    # renderer's own baked-in grade; "natural" keeps real footage close to
+    # how it was shot.
+    CINEMATIC_STYLE_PRESETS: dict[str, dict[str, Any]] = {
+        "moody": {
+            "tone": "cold",
+            "filter": "contrast(1.06) saturate(0.88) brightness(0.92)",
+            "vignette": 0.52,
+        },
+        "natural": {
+            "tone": "clear",
+            "filter": "contrast(1.04) saturate(1.02) brightness(1.0)",
+            "vignette": 0.25,
+        },
+    }
+    # Preset applied when edit_decisions names none. Documentary footage is
+    # meant to look like the place; trailers keep the dark cinematic grade.
+    FAMILY_DEFAULT_STYLE_PRESET = {
+        "documentary-montage": "natural",
+    }
+
+    @classmethod
+    def _resolve_cinematic_style(
+        cls,
+        scene_style: dict[str, Any] | None,
+        renderer_family: str | None = None,
+    ) -> dict[str, Any]:
+        """Merge preset (named or family default) with explicit overrides."""
+        scene_style = scene_style or {}
+        preset_name = scene_style.get("preset") or cls.FAMILY_DEFAULT_STYLE_PRESET.get(
+            renderer_family or ""
+        )
+        if preset_name and preset_name not in cls.CINEMATIC_STYLE_PRESETS:
+            raise ValueError(
+                f"Unknown cinematic_scene_style preset {preset_name!r}. "
+                f"Valid presets: {sorted(cls.CINEMATIC_STYLE_PRESETS)}."
+            )
+        style = dict(cls.CINEMATIC_STYLE_PRESETS.get(preset_name, {}))
+        style.update({
+            k: v for k, v in scene_style.items()
+            if k in ("tone", "filter", "vignette") and v is not None
+        })
+        return style
+
+    @classmethod
     def _cuts_to_cinematic_scenes(
+        cls,
         cuts: list[dict[str, Any]],
         scene_style: dict[str, Any] | None = None,
+        renderer_family: str | None = None,
     ) -> list[dict[str, Any]]:
         """Adapt canonical sequential cuts to CinematicRenderer's scene contract.
 
         ``scene_style`` (from ``edit_decisions.metadata.cinematic_scene_style``)
-        optionally overrides the renderer's baked-in look on every video
-        scene: ``tone`` (cold/steel/void/neutral/clear), ``filter`` (CSS
-        filter string) and ``vignette`` (0-1 edge darkness).
+        sets the look of every video scene: ``preset`` (moody/natural) plus
+        optional overrides ``tone`` (cold/steel/void/neutral/clear),
+        ``filter`` (CSS filter string) and ``vignette`` (0-1 edge darkness).
+        Without a preset, ``renderer_family`` picks the default
+        (documentary-montage -> natural); otherwise the renderer's own
+        baked-in look applies.
         """
 
-        style = {
-            k: v for k, v in (scene_style or {}).items()
-            if k in ("tone", "filter", "vignette") and v is not None
-        }
+        style = cls._resolve_cinematic_style(scene_style, renderer_family)
         scenes: list[dict[str, Any]] = []
         timeline_cursor = 0.0
         hard_transitions = {"cut", "none"}
@@ -1651,6 +2016,29 @@ class VideoCompose(BaseTool):
         # Also accept profile as "output_profile" (skill convention) or "profile"
         profile = inputs.get("profile") or inputs.get("output_profile")
 
+        # Music bed declared in the edit (audio.music). An explicit
+        # audio_path is a finished mix and wins. Resolved before rendering
+        # so a missing track fails fast instead of after a long render.
+        music = None
+        if not inputs.get("audio_path"):
+            try:
+                music = self._music_config(edit_decisions, asset_lookup)
+            except FileNotFoundError as exc:
+                return ToolResult(success=False, error=str(exc))
+
+        # Conform stock clips (codec/size/fps/letterbox) before any runtime
+        # sees them. Opt out with normalize_clips=false (input or
+        # edit_decisions.metadata).
+        normalize_report = None
+        normalize_clips = inputs.get(
+            "normalize_clips",
+            (edit_decisions.get("metadata") or {}).get("normalize_clips", True),
+        )
+        if normalize_clips:
+            normalize_report = self._normalize_clip_sources(
+                resolved_cuts, output_path.parent / ".normalized", profile,
+            )
+
         if render_runtime == "hyperframes":
             return self._render_via_hyperframes(
                 inputs=inputs,
@@ -1668,6 +2056,8 @@ class VideoCompose(BaseTool):
                 resolved_cuts=resolved_cuts,
                 output_path=output_path,
                 profile=profile,
+                normalize_report=normalize_report,
+                music=music,
             )
         # --- Explicit Remotion path (render_runtime == 'remotion') ---
         if self._needs_remotion(resolved_cuts):
@@ -1730,6 +2120,10 @@ class VideoCompose(BaseTool):
                 compose_inputs["profile"] = profile
 
             render_result = self._compose(compose_inputs)
+
+        render_result = self._finish_render_audio(
+            render_result, output_path, normalize_report, music,
+        )
 
         # --- Post-render: mandatory final self-review ---
         if render_result.success and output_path.exists():
@@ -1903,6 +2297,8 @@ class VideoCompose(BaseTool):
         resolved_cuts: list[dict],
         output_path: Path,
         profile: Optional[str],
+        normalize_report: Optional[dict[str, Any]] = None,
+        music: Optional[tuple[dict[str, Any], Path]] = None,
     ) -> ToolResult:
         """Explicit FFmpeg-only render path.
 
@@ -1928,6 +2324,9 @@ class VideoCompose(BaseTool):
             compose_inputs["profile"] = profile
 
         render_result = self._compose(compose_inputs)
+        render_result = self._finish_render_audio(
+            render_result, output_path, normalize_report, music,
+        )
 
         if render_result.success and output_path.exists():
             final_review = self._run_final_review(
@@ -1953,6 +2352,28 @@ class VideoCompose(BaseTool):
                     data=render_result.data,
                 )
 
+        return render_result
+
+    def _finish_render_audio(
+        self,
+        render_result: ToolResult,
+        output_path: Path,
+        normalize_report: Optional[dict[str, Any]],
+        music: Optional[tuple[dict[str, Any], Path]],
+    ) -> ToolResult:
+        """Attach the clip-normalization report and lay in the music bed."""
+        if not render_result.success or not output_path.exists():
+            return render_result
+        if render_result.data is None:
+            render_result.data = {}
+        if normalize_report is not None:
+            render_result.data["clip_normalization"] = normalize_report
+        if music is not None:
+            mix_result = self._mix_music_into_render(output_path, music[1], music[0])
+            if not mix_result.success:
+                return mix_result
+            render_result.data["music_mix"] = mix_result.data
+            render_result.data["has_mixed_audio"] = True
         return render_result
 
     def _remotion_render(self, inputs: dict[str, Any]) -> ToolResult:
@@ -2011,10 +2432,14 @@ class VideoCompose(BaseTool):
 
         if composition_id == "CinematicRenderer":
             if not props.get("scenes") and props.get("cuts"):
-                props["scenes"] = self._cuts_to_cinematic_scenes(
-                    props["cuts"],
-                    (composition_data.get("metadata") or {}).get("cinematic_scene_style"),
-                )
+                try:
+                    props["scenes"] = self._cuts_to_cinematic_scenes(
+                        props["cuts"],
+                        (composition_data.get("metadata") or {}).get("cinematic_scene_style"),
+                        renderer_family,
+                    )
+                except ValueError as exc:
+                    return ToolResult(success=False, error=str(exc))
             props.pop("cuts", None)
             if not props.get("scenes"):
                 return ToolResult(

@@ -193,6 +193,14 @@ You have two tools to smooth this:
 2. **Flag the piece for a uniform color grade at compose time.** Put
    a `grade_profile` hint in `edit_decisions.metadata`. The compose
    director will apply a LUT across the whole timeline.
+3. **Pick the renderer's look.** When the render runs through
+   Remotion's CinematicRenderer, documentary montages default to the
+   `natural` look (no tint gradient, light vignette, near-neutral
+   colour) so places look like they did on the day. For a dark,
+   desaturated trailer feel set
+   `metadata.cinematic_scene_style = {"preset": "moody"}`. Individual
+   `tone` / `filter` / `vignette` keys override the preset. Record the
+   choice if the brief asked for a mood ("bright and warm" → natural).
 
 Don't try to color-grade individual clips here. That's the compose
 stage. Your job is to flag the need.

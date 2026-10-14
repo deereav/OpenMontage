@@ -130,12 +130,26 @@ clip and a 2023 Pexels clip feel like the same film.
 ### 4. Mix The Audio Once, In Compose
 
 The edit artifact already decided volumes, fades, silence windows,
-and L-cut sfx layers. Your job is to execute them faithfully:
+and L-cut sfx layers. Your job is to execute them faithfully.
 
-- Music bed at `edit_decisions.audio.music.volume` (default 0.7).
+`video_compose` (`operation=render`) lays in `edit_decisions.audio.music`
+itself — do NOT pre-mix the bed by hand or pass it as `audio_path`
+(an explicit `audio_path` is treated as a finished mix and the music
+config is skipped). It resolves `asset_id` through the asset manifest,
+loops/trims the track to the render, matches it to the target
+loudness, applies the fades and every `metadata.silence_window`,
+ducks it under any audible render audio (narration), and normalizes
+the final mix to `audio.music.loudness_lufs` (default -14). The
+result is reported in `render_result.data["music_mix"]`.
+
+- `volume` scales the bed relative to other audio: default 1.0 with no
+  narration, 0.2 under a voice. Music-only mixes are loudness-normalized
+  afterwards, so `volume` barely matters there.
 - Fade in per `fade_in_seconds`, fade out per `fade_out_seconds`.
-- Silence window = ducked to 0.0 for the window's duration, ramp
-  back up with a 0.2s hold-off.
+- Silence window = muted for the window's duration with 0.2s ramps
+  either side.
+- Stock-clip ambience in the render is mixed under the music; set
+  `audio.music.replace_render_audio: true` to drop it.
 - L-cut SFX layers = mix at 0.5-0.7 volume, under music.
 - No narration unless explicitly present in `edit_decisions.audio.narration`.
 
@@ -373,9 +387,12 @@ If `video_compose` returns an error:
    (auth / provider / tool bug / plan quality).
 2. If it's a path error, validate every asset_id → path resolution
    in the asset manifest. A single missing file fails the whole render.
-3. If it's a codec error, the input clips may have exotic containers
-   (Archive.org sometimes serves Matroska). Try running each input
-   through `video_trimmer` first to normalize to mp4/h264.
+3. If it's a codec error, check `render_result.data["clip_normalization"]`.
+   `video_compose` already conforms every source clip to the output
+   profile (h264/yuv420p, size, fps, letterbox bars cropped) into
+   `renders/.normalized/` before rendering; a `failed` entry there
+   names the clip ffmpeg could not decode. Replace that clip rather
+   than hand-encoding the whole set.
 4. If it's a memory or timeout error, split the render into halves
    with `video_stitch` at the end.
 5. Surface to the user before swapping to a lower-fidelity path.
