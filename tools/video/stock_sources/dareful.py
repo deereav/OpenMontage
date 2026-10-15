@@ -86,6 +86,9 @@ class DarefulSource:
                 continue
             if not href.startswith("http"):
                 href = f"{_BASE_URL}{href}"
+            # Skip inline affiliate ad cards (post-ad -> shutterstock.7eer.net)
+            if "dareful.com" not in href.lower():
+                continue
 
             title = ""
             title_el = card.select_one("h2, h3, .entry-title, .title")
@@ -144,22 +147,25 @@ class DarefulSource:
 
             download_url = None
 
-            # Look for download links
+            # Look for download links. The "Download video" button points at a
+            # Mux HLS stream (.m3u8), so match that explicitly before falling back.
             for a in soup.select("a[href]"):
                 href = a.get("href", "")
                 text = (a.get_text(strip=True) or "").lower()
-                if any(ext in href.lower() for ext in [".mp4", ".mov", ".webm"]):
+                if _is_third_party_preview(href):
+                    continue
+                if any(ext in href.lower() for ext in [".mp4", ".mov", ".webm", ".m3u8"]):
                     download_url = href
                     break
                 if "download" in text and href:
                     download_url = href
                     break
 
-            # Check video elements
+            # Check video elements (skipping watermarked Shutterstock ad previews)
             if not download_url:
                 for source in soup.select("video source[src], video[src]"):
                     src = source.get("src", "")
-                    if src:
+                    if src and not _is_third_party_preview(src):
                         download_url = src
                         break
 
@@ -177,6 +183,9 @@ class DarefulSource:
     def _stream_download(self, url: str, out_path: Path) -> Path:
         import requests
 
+        if ".m3u8" in url.lower():
+            return self._hls_download(url, out_path)
+
         with requests.get(
             url, stream=True, timeout=180,
             headers={"User-Agent": "OpenMontage/1.0"},
@@ -187,3 +196,27 @@ class DarefulSource:
                     if chunk:
                         f.write(chunk)
         return out_path
+
+    def _hls_download(self, url: str, out_path: Path) -> Path:
+        """Remux an HLS stream to MP4. ffmpeg's default stream selection
+        takes the highest-resolution variant from the master playlist."""
+        import subprocess
+
+        proc = subprocess.run(
+            [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-i", url,
+                "-c", "copy", "-bsf:a", "aac_adtstoasc",
+                str(out_path),
+            ],
+            capture_output=True, text=True, timeout=600,
+        )
+        if proc.returncode != 0 or not out_path.exists():
+            raise RuntimeError(f"ffmpeg HLS remux failed: {proc.stderr.strip()[:300]}")
+        return out_path
+
+
+def _is_third_party_preview(url: str) -> bool:
+    # Dareful pages embed Shutterstock "related footage" previews: watermarked
+    # and not covered by Dareful's CC BY license.
+    return "shutterstock" in url.lower() or "picdn.net" in url.lower()
