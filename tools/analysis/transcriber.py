@@ -8,6 +8,10 @@ are not available.
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -40,7 +44,9 @@ class Transcriber(BaseTool):
     install_instructions = (
         "pip install faster-whisper  # CPU mode\n"
         "pip install faster-whisper[gpu]  # GPU mode (requires CUDA)\n"
-        "pip install whisperx  # For diarization support"
+        "# Diarization: WhisperX pins an older torch/transformers, so install it\n"
+        "# in a side venv (.venv-whisperx) or point OPENMONTAGE_WHISPERX_PYTHON at\n"
+        "# an interpreter that has it; set HF_TOKEN for the pyannote models."
     )
     agent_skills = ["speech-to-text"]
 
@@ -102,12 +108,29 @@ class Transcriber(BaseTool):
         except ImportError:
             return ToolStatus.UNAVAILABLE
 
-    def _has_diarization(self) -> bool:
+    def _whisperx_python(self) -> Optional[str]:
+        """Interpreter that can import WhisperX, or None.
+
+        Prefers OPENMONTAGE_WHISPERX_PYTHON, then the repo's .venv-whisperx
+        side environment, then the current interpreter.
+        """
+        override = os.environ.get("OPENMONTAGE_WHISPERX_PYTHON")
+        if override:
+            return override if Path(override).exists() else None
+
+        side_venv = Path(__file__).resolve().parents[2] / ".venv-whisperx"
+        for candidate in (side_venv / "Scripts" / "python.exe", side_venv / "bin" / "python"):
+            if candidate.exists():
+                return str(candidate)
+
         try:
             import whisperx  # noqa: F401
-            return True
+            return sys.executable
         except ImportError:
-            return False
+            return None
+
+    def _has_diarization(self) -> bool:
+        return self._whisperx_python() is not None
 
     def estimate_runtime(self, inputs: dict[str, Any]) -> float:
         """Rough estimate: ~0.5x real-time on CPU for 'base' model."""
@@ -210,8 +233,9 @@ class Transcriber(BaseTool):
         duration = info.duration
 
         # Optional diarization pass
-        if diarize and self._has_diarization():
-            segments = self._apply_diarization(
+        diarization = None
+        if diarize:
+            segments, diarization = self._apply_diarization(
                 str(input_path), segments, detected_language
             )
 
@@ -226,6 +250,7 @@ class Transcriber(BaseTool):
             "device": device,
             "compute_type": compute_type,
             "gpu_fallback_reason": gpu_fallback_reason,
+            "diarization": diarization,
         }
 
         # Write transcript JSON
@@ -244,36 +269,48 @@ class Transcriber(BaseTool):
         audio_path: str,
         segments: list[dict],
         language: str,
-    ) -> list[dict]:
-        """Apply WhisperX diarization to assign speaker labels."""
-        try:
-            import whisperx
+    ) -> tuple[list[dict], dict]:
+        """Apply WhisperX alignment + diarization in a WhisperX interpreter.
 
-            # Load audio for alignment
-            audio = whisperx.load_audio(audio_path)
+        Best-effort: on any failure the original segments are returned, and
+        the status dict says why.
+        """
+        python = self._whisperx_python()
+        if python is None:
+            return segments, {
+                "status": "unavailable",
+                "note": "WhisperX not found; see install_instructions",
+            }
+        if not os.environ.get("HF_TOKEN"):
+            return segments, {
+                "status": "skipped",
+                "note": "HF_TOKEN not set; pyannote diarization models are gated on HuggingFace",
+            }
 
-            # Align segments with word timestamps
-            align_model, align_metadata = whisperx.load_align_model(
-                language_code=language, device="cpu"
+        worker = Path(__file__).with_name("whisperx_diarize_worker.py")
+        with tempfile.TemporaryDirectory() as tmp:
+            request_path = Path(tmp) / "request.json"
+            response_path = Path(tmp) / "response.json"
+            request_path.write_text(
+                json.dumps(
+                    {"audio_path": audio_path, "segments": segments, "language": language}
+                ),
+                encoding="utf-8",
             )
-            aligned = whisperx.align(
-                segments, align_model, align_metadata, audio, device="cpu"
-            )
+            try:
+                proc = subprocess.run(
+                    [python, "-I", str(worker), str(request_path), str(response_path)],
+                    capture_output=True,
+                    text=True,
+                    timeout=3600,
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                return segments, {"status": "failed", "note": f"{type(exc).__name__}: {exc}"}
 
-            # Diarize
-            import os
-            hf_token = os.environ.get("HF_TOKEN")
-            if not hf_token:
-                # Can't diarize without HuggingFace token for pyannote
-                return segments
+            if proc.returncode != 0 or not response_path.exists():
+                tail = (proc.stderr or "").strip().splitlines()[-5:]
+                return segments, {"status": "failed", "note": "\n".join(tail)}
 
-            diarize_model = whisperx.DiarizationPipeline(
-                use_auth_token=hf_token, device="cpu"
-            )
-            diarize_segments = diarize_model(audio)
-            result = whisperx.assign_word_speakers(diarize_segments, aligned)
+            response = json.loads(response_path.read_text(encoding="utf-8"))
 
-            return result.get("segments", segments)
-        except Exception:
-            # Diarization is best-effort; return original segments on failure
-            return segments
+        return response["segments"], {"status": response["status"], "note": response["note"]}
