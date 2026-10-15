@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -95,8 +96,21 @@ class PiperTTS(BaseTool):
     side_effects = ["writes audio file to output_path"]
     user_visible_verification = ["Listen to generated audio for intelligibility"]
 
+    @staticmethod
+    def _piper_cmd() -> str | None:
+        # Fall back to the interpreter's own scripts dir so an un-activated venv still works.
+        return shutil.which("piper") or shutil.which("piper", path=str(Path(sys.executable).parent))
+
+    @staticmethod
+    def _resolve_model(model: str) -> str:
+        # Piper only resolves bare voice names against cwd; also check the documented download dir.
+        if Path(model).exists():
+            return model
+        candidate = Path.home() / ".piper" / "models" / f"{model}.onnx"
+        return str(candidate) if candidate.exists() else model
+
     def get_status(self) -> ToolStatus:
-        if shutil.which("piper"):
+        if self._piper_cmd():
             return ToolStatus.AVAILABLE
         return ToolStatus.UNAVAILABLE
 
@@ -122,8 +136,8 @@ class PiperTTS(BaseTool):
 
         proc = subprocess.run(
             [
-                "piper",
-                "--model", inputs.get("model", "en_US-lessac-medium"),
+                self._piper_cmd() or "piper",
+                "--model", self._resolve_model(inputs.get("model", "en_US-lessac-medium")),
                 "--speaker", str(inputs.get("speaker_id", 0)),
                 "--length-scale", str(inputs.get("length_scale", 1.0)),
                 "--sentence-silence", str(inputs.get("sentence_silence", 0.3)),
